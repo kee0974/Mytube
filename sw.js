@@ -1,5 +1,5 @@
-const CACHE='mytube-shell-v2';
-const ASSETS=['./','./index.html','./styles.css','./app.js','./db.js','./model.js','./manifest.webmanifest','./icon-192.png','./icon-512.png'];
+const CACHE='mytube-shell-v3.0.0';
+const ASSETS=['./','./index.html','./ui-v3.css?v=3.0.0','./ui-v3.js?v=3.0.0','./db.js','./model.js','./manifest.webmanifest','./icon-192.png','./icon-512.png'];
 self.addEventListener('install',event=>event.waitUntil(caches.open(CACHE).then(cache=>cache.addAll(ASSETS))));
 self.addEventListener('activate',event=>event.waitUntil((async()=>{for(const key of await caches.keys())if(key.startsWith('mytube-shell-')&&key!==CACHE)await caches.delete(key);await self.clients.claim();})()));
 let databasePromise;
