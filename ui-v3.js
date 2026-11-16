@@ -1,3 +1,5 @@
+import {enableLibraryDrag,validateDrop} from './library-drag.js';
+import {parseSubtitles} from './subtitles.js';
 import * as db from './db.js';
 import {ROOTS,ancestors,descendants,canMove,validName} from './model.js';
 const $=id=>document.getElementById(id),audio=$('audio'),video=$('video'),ctx=$('canvas').getContext('2d');
@@ -5,7 +7,7 @@ const icons={volume:'<path d="M11 5 6 9H3v6h3l5 4Z M15 8a6 6 0 0 1 0 8M18 5a10 1
 const icon=(id,n)=>$(id).innerHTML='<svg viewBox="0 0 24 24" aria-hidden="true">'+icons[n]+'</svg>';
 icon('volbtn','volume');icon('mark','mark');icon('cc','cc');icon('play','play');icon('full','full');$('cc').classList.add('on');
 let page='home',stack=[],item=null,media=audio,ac,analyser,data,bins,raf=0,cc=true,dragging=false,gesture=null,lastTap=null,feedbackTimer;
-let items=[],busy=false,offlineReady=false;
+let items=[],busy=false,offlineReady=false,libraryDrag=null;
 const heights=new Float32Array(9);
 const fmt=t=>{t=Math.max(0,Math.floor(t||0));return(t>=3600?Math.floor(t/3600)+':':'')+String(Math.floor(t/60)%60).padStart(t>=3600?2:1,'0')+':'+String(t%60).padStart(2,'0');};
 const notice=s=>$('notice').textContent=s;
@@ -24,28 +26,32 @@ async function animatePage(direction,change){
   }else{main.style.transform='';change();}
  }finally{main.style.transform='';navigating=false;}
 }
-function go(p){if(busy)return;return animatePage('forward',()=>{stack.push(page);page=p;render();});}
+function go(p){if(busy||libraryDrag?.active())return;return animatePage('forward',()=>{stack.push(page);page=p;render();});}
 async function back(){if(!stack.length||navigating||busy)return;if(document.fullscreenElement)try{await document.exitFullscreen();}catch{}$('screen').classList.remove('expanded');document.body.style.overflow='';return animatePage('back',()=>{page=stack.pop();render();});}
 function render(){
+ clearTimeout(tapTimer);
  if(gesture){clearTimeout(gesture.timer);gesture=null;}media.pause();cancelAnimationFrame(raf);lastTap=null;$('feedback').hidden=true;
  const playing=typeof page==='object';$('player').hidden=!playing;$('library').hidden=playing;
  const folder=items.find(x=>x.id===page);if(!playing&&page!=='home'&&!folder)page='home';
  $('back').hidden=page==='home';const previous=stack.at(-1);$('back').textContent='‹ '+(items.find(x=>x.id===previous)?.name||'ブラウズ');
  $('add').hidden=playing;$('add').disabled=busy;$('new-folder').hidden=playing||page==='home';$('new-folder').disabled=busy;
  $('crumbs').replaceChildren();const chain=ancestors(items,playing?page.parent:page==='home'?null:page);
- for(const node of [{id:'home',name:'ブラウズ'},...chain]){const b=document.createElement('button');b.textContent=node.name;b.disabled=busy;b.onclick=()=>go(node.id);$('crumbs').append(b);}
+ for(const node of [{id:'home',name:'ブラウズ'},...chain]){const b=document.createElement('button');b.textContent=node.name;b.dataset.folderId=node.id;b.disabled=busy;b.onclick=()=>go(node.id);$('crumbs').append(b);}
  if(playing){openPlayer(page);return;}item=null;$('library').replaceChildren();$('title').textContent=folder?.name||'ブラウズ';
  const grid=document.createElement('div');grid.className='grid';
  const list=items.filter(x=>x.parent===(page==='home'?null:page)).sort((a,b)=>(a.type==='folder'?0:1)-(b.type==='folder'?0:1)||a.name.localeCompare(b.name,'ja'));
  for(const x of list){
-  const b=document.createElement('button');b.className='tile';b.disabled=busy;
+  const card=document.createElement('div');card.className='file-card';card.dataset.itemId=x.id;
+  const b=document.createElement('button');b.className='tile';b.disabled=busy;b.setAttribute('aria-label',x.name+'を開く');
   const a=document.createElement('span');a.className=x.type==='folder'?'folder':'thumb '+(x.type==='audio'?'music':'');
   if(x.type!=='folder'){if(x.thumb){const img=document.createElement('img');img.src=x.thumb;img.alt='';a.append(img);}else a.textContent=x.type==='audio'?'♫':'▶';}
-  const n=document.createElement('span');n.className='name';n.textContent=x.name;const small=document.createElement('span');small.className='muted';small.textContent=x.type==='folder'?items.filter(y=>y.parent===x.id).length+'項目':x.pending?'取り込み中断':x.duration?fmt(x.duration):size(x.size);
-  b.append(a,n,small);let hold,held=false,origin;
-  b.onclick=()=>{if(held){held=false;return;}if(x.pending){menu(x);return;}go(x.type==='folder'?x.id:x);};
-  if(!ROOTS.includes(x.id)){b.onpointerdown=e=>{held=false;origin={x:e.clientX,y:e.clientY};hold=setTimeout(()=>{held=true;menu(x);},650);};b.onpointermove=e=>{if(origin&&Math.hypot(e.clientX-origin.x,e.clientY-origin.y)>10)clearTimeout(hold);};for(const ev of ['pointerup','pointercancel','pointerleave'])b.addEventListener(ev,()=>clearTimeout(hold));b.oncontextmenu=e=>{e.preventDefault();clearTimeout(hold);held=true;menu(x);};}
-  grid.append(b);
+  b.append(a);b.onclick=()=>{if(x.pending){menu(x);return;}go(x.type==='folder'?x.id:x);};
+  const n=document.createElement('button');n.className='name';n.textContent=x.name;n.disabled=busy;n.setAttribute('aria-label',ROOTS.includes(x.id)?x.name+'を開く':x.name+'の名前を変更');
+  n.onclick=e=>{e.stopPropagation();if(ROOTS.includes(x.id))go(x.id);else rename(x);};
+  const small=document.createElement('span');small.className='muted';small.textContent=x.type==='folder'?items.filter(y=>y.parent===x.id).length+'項目':x.pending?'取り込み中断':x.duration?fmt(x.duration):size(x.size);
+  card.append(b,n,small);
+  if(!ROOTS.includes(x.id)){const more=document.createElement('button');more.className='item-menu';more.textContent='⋯';more.setAttribute('aria-label',x.name+'の操作');more.onclick=e=>{e.stopPropagation();menu(x);};card.append(more);}
+  grid.append(card);
  }
  $('library').append(grid);$('count').textContent=list.length+'項目';
 }
@@ -63,16 +69,25 @@ function sync(){const t=media.currentTime||0,d=media.duration;if(!dragging)$('se
 function openPlayer(x){item=x;notice('');$('title').textContent=x.name;$('count').textContent=x.type==='audio'?'音声':'ビデオ';media=x.type==='video'?video:audio;video.hidden=media!==video;$('visual').hidden=media===video;$('volbox').hidden=true;$('volbtn').setAttribute('aria-expanded','false');media.src=localMediaURL(x);media.volume=Number($('volume').value);media.load();heights.fill(0);dragging=false;$('seek').value=0;drawMarks();playState();fullState();draw();}
 function draw(){if(!item)return;if(media===audio){ctx.clearRect(0,0,450,192);let rms=0;const bands=new Float32Array(9);if(analyser&&!media.paused){analyser.getFloatTimeDomainData(data);analyser.getByteFrequencyData(bins);for(const v of data)rms+=v*v;rms=Math.min(1,Math.sqrt(rms/data.length)*12);const step=ac.sampleRate/analyser.fftSize;for(let i=0;i<9;i++){const low=Math.max(1,Math.floor(100*Math.pow(1.55,i)/step)),high=Math.min(bins.length-1,Math.ceil(100*Math.pow(1.55,i+1)/step));for(let j=low;j<=high;j++)bands[i]=Math.max(bands[i],bins[j]/255);}}ctx.fillStyle='#fff';for(let i=0;i<9;i++){const target=rms*(.2+.8*bands[i]);heights[i]+=(target-heights[i])*.3;const h=24+heights[i]*145;ctx.beginPath();ctx.roundRect(22+i*47,(192-h)/2,30,h,15);ctx.fill();}}sync();raf=requestAnimationFrame(draw);}
 for(const m of [audio,video]){m.addEventListener('loadedmetadata',()=>{if(m===media){drawMarks();sync();}});for(const e of ['play','pause','ended'])m.addEventListener(e,()=>{if(m===media)playState();});m.addEventListener('error',()=>{if(m===media)notice(navigator.serviceWorker?.controller?'保存データを再生できませんでした。対応形式・保存内容を確認してください。元ファイルは削除しないでください。':'再生の準備中です。オンラインで一度再読み込みしてください。');});}
-$('play').onclick=async()=>{if(!media.paused){media.pause();return;}try{if(media===audio){graph();if(ac)await ac.resume();}await media.play();}catch{notice('再生を開始できませんでした。もう一度押してください。');}};
+async function togglePlayback(){if(!media.paused){media.pause();return;}try{if(media===audio){graph();if(ac)await ac.resume();}await media.play();}catch{notice('再生を開始できませんでした。もう一度押してください。');}}
+$('play').onclick=()=>{clearTimeout(tapTimer);lastTap=null;togglePlayback();};
 $('seek').oninput=()=>{dragging=true;seek(Number($('seek').value));};$('seek').onchange=()=>dragging=false;$('seek').onpointercancel=()=>dragging=false;
 $('volbtn').onclick=()=>{$('volbox').hidden=!$('volbox').hidden;$('volbtn').setAttribute('aria-expanded',String(!$('volbox').hidden));};$('volume').oninput=()=>media.volume=Number($('volume').value);
-$('cc').onclick=()=>{cc=!cc;$('cc').classList.toggle('on',cc);$('cc').setAttribute('aria-pressed',String(cc));$('cc').setAttribute('aria-label',cc?'字幕を非表示':'字幕を表示');if(cc&&!item?.subtitles?.length)notice('このファイルには字幕データがありません。自動文字起こしは未対応です。');};
+$('cc').onclick=()=>{if(!item?.subtitles?.length){subtitleMenu(item);return;}cc=!cc;$('cc').classList.toggle('on',cc);$('cc').setAttribute('aria-pressed',String(cc));$('cc').setAttribute('aria-label',cc?'字幕を非表示':'字幕を表示');if(cc&&!item?.subtitles?.length)notice('このファイルには字幕データがありません。自動文字起こしは未対応です。');};
 $('mark').onclick=()=>{if(!Number.isFinite(media.duration)||getMarks().some(m=>Math.abs(m.t-media.currentTime)<.25))return;save([...getMarks(),{id:Date.now()+'-'+Math.random().toString(36).slice(2),t:media.currentTime}]);};
 function fullState(){const on=!!document.fullscreenElement||$('screen').classList.contains('expanded');icon('full',on?'exit':'full');$('full').setAttribute('aria-label',on?'全画面を終了':'全画面表示');}
 $('full').onclick=async()=>{const s=$('screen');try{if(document.fullscreenElement)await document.exitFullscreen();else if(s.classList.contains('expanded')){s.classList.remove('expanded');document.body.style.overflow='';}else{try{if(!s.requestFullscreen)throw Error();await s.requestFullscreen();}catch{s.classList.add('expanded');document.body.style.overflow='hidden';}}}catch{notice('全画面を切り替えられませんでした。');}fullState();};
 document.addEventListener('fullscreenchange',fullState);document.addEventListener('keydown',e=>{if(e.key==='Escape'){$('screen').classList.remove('expanded');document.body.style.overflow='';fullState();}});
 function feedback(text,detail){clearTimeout(feedbackTimer);$('feedback').replaceChildren(document.createTextNode(text));if(detail){const small=document.createElement('small');small.textContent=detail;$('feedback').append(small);}$('feedback').hidden=false;}
 function hideSoon(){clearTimeout(feedbackTimer);feedbackTimer=setTimeout(()=>$('feedback').hidden=true,700);}
+let tapTimer;
+function queuePlayerTap(e){
+ const rect=screen.getBoundingClientRect(),x=(e.clientX-rect.left)/rect.width,side=x<.3?'left':x>.7?'right':null,now=performance.now();
+ clearTimeout(tapTimer);
+ if(side&&lastTap&&lastTap.side===side&&now-lastTap.t<340){seek(media.currentTime+(side==='left'?-10:10));feedback(side==='left'?'−10秒':'＋10秒');hideSoon();lastTap=null;return;}
+ lastTap={side,t:now};const target=media,selected=item;
+ tapTimer=setTimeout(()=>{lastTap=null;if(media===target&&item===selected)togglePlayback();},350);
+}
 const screen=$('screen');screen.addEventListener('contextmenu',e=>{if(!e.target.closest('.controls'))e.preventDefault();});
 screen.addEventListener('pointerdown',e=>{
  if(e.target.closest('.controls')||!e.isPrimary||e.button!==0||gesture||navigating)return;
@@ -85,7 +100,7 @@ function updateSeekGesture(e){
  if(!g.active){
   if(Math.abs(dy)>12&&Math.abs(dy)>Math.abs(dx)*1.4){g.valid=false;return;}
   if(Math.abs(dx)<6||Math.abs(dx)<Math.abs(dy)*1.2||!Number.isFinite(media.duration))return;
-  g.active=true;g.resume=!media.paused;media.pause();lastTap=null;
+  g.active=true;g.resume=!media.paused;media.pause();clearTimeout(tapTimer);lastTap=null;
  }
  if(e.cancelable)e.preventDefault();
  const destination=Math.max(0,Math.min(media.duration,g.origin+dx*.2));seek(destination);
@@ -98,9 +113,7 @@ function finish(e,cancel=false){
  gesture=null;if(screen.hasPointerCapture(e.pointerId))screen.releasePointerCapture(e.pointerId);
  if(g.active){if(cancel)seek(g.origin);if(g.resume&&media===g.media)media.play().catch(()=>notice('再生ボタンを押して再開してください。'));hideSoon();return;}
  if(cancel||!g.valid||performance.now()-g.t>400){lastTap=null;return;}
- const rect=screen.getBoundingClientRect(),x=(e.clientX-rect.left)/rect.width,side=x<.3?'left':x>.7?'right':null,now=performance.now();
- if(!side){lastTap=null;return;}
- if(lastTap&&lastTap.side===side&&now-lastTap.t<340){seek(media.currentTime+(side==='left'?-10:10));feedback(side==='left'?'−10秒':'＋10秒');hideSoon();lastTap=null;}else lastTap={side,t:now};
+ queuePlayerTap(e);
 }
 screen.addEventListener('pointerup',e=>finish(e));screen.addEventListener('pointercancel',e=>finish(e,true));screen.addEventListener('lostpointercapture',e=>{if(gesture?.id===e.pointerId)finish(e,true);});
 let swipe=null;
@@ -111,7 +124,7 @@ function resetSwipe(){
  swipe=null;
 }
 function beginBackSwipe(e){
- if(busy||navigating||!stack.length||!e.isPrimary||e.button!==0||$('about').open||$('actions').open)return;
+ if(libraryDrag?.active()||busy||navigating||!stack.length||!e.isPrimary||e.button!==0||$('about').open||$('actions').open)return;
  if(e.target.closest('input,.controls,#marks,button:not(.tile)'))return;
  const inPlayer=!!e.target.closest('#screen');
  const edge=inPlayer&&e.clientX-screen.getBoundingClientRect().left<=48;
@@ -120,7 +133,7 @@ function beginBackSwipe(e){
  if(edge)e.stopPropagation();
 }
 function moveBackSwipe(e){
- if(!swipe||swipe.id!==e.pointerId)return;
+ if(libraryDrag?.active()||!swipe||swipe.id!==e.pointerId)return;
  const dx=e.clientX-swipe.x,dy=Math.abs(e.clientY-swipe.y);
  if(!swipe.active){
   if(dy>16&&dy>Math.abs(dx)*1.4){resetSwipe();return;}
@@ -131,11 +144,12 @@ function moveBackSwipe(e){
  if(!reducedMotion())main.style.transform=`translateX(${Math.max(0,dx)}px)`;
 }
 function endBackSwipe(e,cancel=false){
- if(!swipe||swipe.id!==e.pointerId)return;
+ if(libraryDrag?.active()||!swipe||swipe.id!==e.pointerId)return;
  const g=swipe,dx=e.clientX-g.x,dy=Math.abs(e.clientY-g.y),elapsed=Math.max(1,performance.now()-g.t);
  swipe=null;
  if(main.hasPointerCapture(e.pointerId))main.releasePointerCapture(e.pointerId);
  if(g.active)suppressClickUntil=Date.now()+450;
+ if(!cancel&&g.edge&&!g.active&&Math.abs(dx)<8&&dy<8&&elapsed<400){queuePlayerTap(e);resetSwipe();return;}
  if(!cancel&&dx>dy*1.15&&(dx>=50||(dx>=25&&dx/elapsed>.35))){suppressClickUntil=Date.now()+450;back();}else resetSwipe();
 }
 document.addEventListener('pointerdown',beginBackSwipe,true);
@@ -162,7 +176,7 @@ function button(label,fn){const b=document.createElement('button');b.textContent
 function actions(title){$('action-title').textContent=title;$('action-body').replaceChildren();if(!$('actions').open)$('actions').showModal();return $('action-body');}
 function uniqueName(name,parent,except){if(items.some(x=>x.parent===parent&&x.name===name&&x.id!==except))throw Error('同じ名前の項目があります。');return name;}
 function rename(x){const body=actions(x?'名前を変更':'新しいフォルダ'),input=document.createElement('input');input.value=x?.name||'';input.maxLength=240;input.setAttribute('aria-label','名前');body.append(input);body.append(button('保存',async()=>{const parent=x?x.parent:page,name=uniqueName(validName(input.value),parent,x?.id);const latest=x?(await db.all()).find(y=>y.id===x.id):null;if(x&&!latest)throw Error('項目が見つかりません。');await db.put(latest?{...latest,name}:{id:crypto.randomUUID(),name,parent,root:items.find(y=>y.id===page).root,type:'folder',created:Date.now()});$('actions').close();await refresh();}));input.focus();}
-function menu(x){if(busy||ROOTS.includes(x.id))return;const body=actions(x.name);body.append(button('名前を変更',()=>rename(x)),button('別のフォルダへ移動',()=>move(x)));if(x.type!=='folder'&&!x.pending)body.append(button('ファイルに書き出す',()=>{const a=document.createElement('a');a.href=localMediaURL(x,true);a.download=x.name;document.body.append(a);a.click();a.remove();}));const del=button('削除',async()=>{const ids=descendants(items,x.id);if(!confirm('「'+x.name+'」'+(ids.size>1?'と中の'+(ids.size-1)+'項目':'')+'を削除しますか？'))return;await markQueue;await db.remove([...ids]);$('actions').close();await refresh();});del.className='danger';body.append(del);}
+function menu(x){if(busy||ROOTS.includes(x.id))return;const body=actions(x.name);body.append(button('名前を変更',()=>rename(x)),button('別のフォルダへ移動',()=>move(x)));if(x.type!=='folder'&&!x.pending)body.append(button('字幕を設定',()=>subtitleMenu(x)));if(x.type!=='folder'&&!x.pending)body.append(button('ファイルに書き出す',()=>{const a=document.createElement('a');a.href=localMediaURL(x,true);a.download=x.name;document.body.append(a);a.click();a.remove();}));const del=button('削除',async()=>{const ids=descendants(items,x.id);if(!confirm('「'+x.name+'」'+(ids.size>1?'と中の'+(ids.size-1)+'項目':'')+'を削除しますか？'))return;await markQueue;await db.remove([...ids]);$('actions').close();await refresh();});del.className='danger';body.append(del);}
 function move(x){let target=x.root;const excluded=descendants(items,x.id);function show(){const body=actions('移動先を選択'),p=document.createElement('p');p.textContent=ancestors(items,target).map(y=>y.name).join(' / ');body.append(p);const parent=items.find(y=>y.id===target)?.parent;if(parent)body.append(button('‹ 上のフォルダ',()=>{target=parent;show();}));for(const f of items.filter(y=>y.type==='folder'&&y.parent===target&&!excluded.has(y.id)))body.append(button('📁 '+f.name,()=>{target=f.id;show();}));const save=button('このフォルダへ移動',async()=>{if(!canMove(items,x,target))throw Error('この場所には移動できません。');uniqueName(x.name,target,x.id);const latest=(await db.all()).find(y=>y.id===x.id);if(!latest)throw Error('項目が見つかりません。');await db.put({...latest,parent:target});$('actions').close();await refresh();});save.disabled=!canMove(items,x,target);body.append(save);}show();}
 async function importFiles(list){
  if(busy||!list.length)return;const parent=page;busy=true;render();$('import-status').hidden=false;let success=0;const failures=[];
@@ -184,6 +198,39 @@ $('add').onclick=()=>{const root=items.find(x=>x.id===page)?.root;$('file').acce
 $('file').onchange=e=>{const list=Array.from(e.target.files);e.target.value='';importFiles(list).catch(error);};
 $('protect').onclick=async()=>{try{const granted=await navigator.storage?.persist?.();$('storage-info').textContent=granted?'保存保護が許可されました。Webサイトデータの手動削除は防げません。':'この環境では保存保護が許可されませんでした。元ファイルは別にも保管してください。';}catch(e){error(e);}};
 window.addEventListener('beforeunload',e=>{if(busy){e.preventDefault();e.returnValue='';}});
+let subtitleTarget=null;
+function subtitleMenu(x){
+ if(!x)return;const body=actions('字幕 — '+x.name);const p=document.createElement('p');p.textContent=x.subtitles?.length?x.subtitles.length+'件の字幕を保存済みです。':'字幕データがありません。SRT／VTTを追加するか、時刻と文章を入力してください。自動文字起こしではありません。';body.append(p);
+ body.append(button('SRT／VTTファイルを選ぶ',()=>{subtitleTarget=x;$('subtitle-file').click();}),button('字幕を手入力する',()=>editSubtitle(x)));
+ if(x.subtitles?.length){body.append(button('字幕を表示 / 非表示',()=>{cc=!cc;$('cc').classList.toggle('on',cc);$('cc').setAttribute('aria-pressed',String(cc));$('actions').close();}),button('字幕を削除',async()=>{if(confirm('このファイルの字幕を削除しますか？')){await saveSubtitles(x,[]);$('actions').close();}}));}
+}
+async function saveSubtitles(x,cues){
+ await markQueue;const latest=(await db.all()).find(y=>y.id===x.id);if(!latest)throw Error('ファイルが見つかりません。');
+ await db.put({...latest,subtitles:cues});x.subtitles=cues;if(item?.id===x.id)item.subtitles=cues;items=await db.all();cc=true;$('cc').classList.add('on');$('cc').setAttribute('aria-pressed','true');sync();
+}
+function editSubtitle(x){
+ const body=actions('字幕を追加');const inputs=[];
+ for(const [label,value,type] of [['開始（秒）',String(Math.floor(item?.id===x.id?media.currentTime:0)),'number'],['終了（秒）',String(Math.floor(item?.id===x.id?media.currentTime:0)+5),'number'],['字幕の文章','','text']]){const l=document.createElement('label');l.textContent=label;const input=document.createElement(type==='text'?'textarea':'input');if(type!=='text'){input.type=type;input.min='0';input.step='.1';}input.value=value;input.setAttribute('aria-label',label);l.append(input);body.append(l);inputs.push(input);}
+ body.append(button('保存',async()=>{const start=Number(inputs[0].value),end=Number(inputs[1].value),text=inputs[2].value.trim();if(!Number.isFinite(start)||!Number.isFinite(end)||start<0||end<=start||!text)throw Error('開始・終了時刻と字幕の文章を確認してください。');await saveSubtitles(x,[...(x.subtitles||[]),{start,end,text}].sort((a,b)=>a.start-b.start));$('actions').close();}));
+}
+$('subtitle-file').onchange=async e=>{const file=e.target.files[0],target=subtitleTarget;e.target.value='';if(!file||!target)return;try{if(file.size>5*1024*1024)throw Error('字幕ファイルは5MB以下で指定してください。');const cues=parseSubtitles(await file.text());await saveSubtitles(target,cues);$('actions').close();notice(cues.length+'件の字幕を保存しました。');}catch(e){error(e);}};
+libraryDrag=enableLibraryDrag({
+ items:()=>items,page:()=>typeof page==='string'?page:page.parent,
+ blocked:()=>busy||navigating||typeof page!=='string'||$('actions').open||$('about').open,
+ prepare:()=>{resetSwipe();clearTimeout(tapTimer);},
+ suppress:()=>{suppressClickUntil=Date.now()+650;},
+ navigate:async(target,backward)=>{
+  if(navigating)return;
+  await animatePage(backward?'back':'forward',()=>{
+   page=target;const path=target==='home'?[]:ancestors(items,target);stack=target==='home'?[]:['home',...path.slice(0,-1).map(x=>x.id)];render();
+  });
+ },
+ drop:async(id,target)=>{
+  await markQueue;const latest=await db.all(),updated=validateDrop(latest,id,target);
+  if(updated)await db.put(updated);items=await db.all();render();
+  if(updated){$('import-status').hidden=false;$('import-status').textContent='「'+updated.name+'」を「'+items.find(x=>x.id===target).name+'」へ移動しました。';}
+ },error:e=>{$('import-status').hidden=false;$('import-status').textContent=e.message||'移動できませんでした。';}
+});
 try{
  await db.openDB();items=await db.all();render();
  if('serviceWorker' in navigator){navigator.serviceWorker.addEventListener('controllerchange',()=>{if(item&&media.error){media.load();notice('再生の準備ができました。再生ボタンを押してください。');}});navigator.serviceWorker.register('./sw.js').then(()=>navigator.serviceWorker.ready).then(()=>{offlineReady=true;}).catch(()=>{$('import-status').hidden=false;$('import-status').textContent='オフラインの準備に失敗しました。オンラインで再読み込みしてください。';});}
