@@ -63,3 +63,4 @@ export async function add(item,file,onProgress=()=>{},options={}){
  }catch(e){try{await remove([item.id]);}catch{}throw storageError(e);}
 }
 export const remove=ids=>mutate(['items','media','chunks'],tx=>{for(const id of ids){tx.objectStore('items').delete(id);tx.objectStore('media').delete(id);const req=tx.objectStore('chunks').index('file').openCursor(IDBKeyRange.only(id));req.onsuccess=()=>{const cursor=req.result;if(cursor){cursor.delete();cursor.continue();}};}});
+export function setThumbnail(id,thumb,source='auto',replace=false){return mutate(['items'],tx=>{const store=tx.objectStore('items'),r=store.get(id);r.onsuccess=()=>{const entry=r.result;if(!entry||(source==='auto'&&entry.thumbSource==='custom'&&!replace))return;store.put({...entry,thumb,thumbSource:source});};});}

@@ -1,7 +1,9 @@
+import {imageThumbnail,videoThumbnail} from './thumbnails.js';
+import {runImportBatch} from './import-batch.js';
 import {enableLibraryDrag,validateDrop} from './library-drag.js';
 import {formatImportError,importProgress} from './import-status.js';
 import {parseSubtitles} from './subtitles.js';
-import * as db from './db.js?v=3.2.1';
+import * as db from './db.js?v=3.3.0';
 import {ROOTS,ancestors,descendants,canMove,validName} from './model.js';
 const $=id=>document.getElementById(id),audio=$('audio'),video=$('video'),ctx=$('canvas').getContext('2d');
 const icons={volume:'<path d="M11 5 6 9H3v6h3l5 4Z M15 8a6 6 0 0 1 0 8M18 5a10 10 0 0 1 0 14"/>',mark:'<path d="M6 21V4m0 0c4-3 8 3 13 0v10c-5 3-9-3-13 0"/>',cc:'<rect x="2" y="5" width="20" height="14" rx="3"/><path d="M10 10a3 3 0 1 0 0 4M18 10a3 3 0 1 0 0 4"/>',play:'<path d="m8 5 11 7-11 7Z" fill="currentColor" stroke="none"/>',pause:'<path d="M8 5v14M16 5v14" stroke-width="4"/>',full:'<path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/>',exit:'<path d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/>'};
@@ -54,7 +56,7 @@ function render(){
   if(!ROOTS.includes(x.id)){const more=document.createElement('button');more.className='item-menu';more.textContent='⋯';more.setAttribute('aria-label',x.name+'の操作');more.onclick=e=>{e.stopPropagation();menu(x);};card.append(more);}
   grid.append(card);
  }
- $('library').append(grid);$('count').textContent=list.length+'項目';
+ $('library').append(grid);$('count').textContent=list.length+'項目';setTimeout(scheduleThumbs,0);
 }
 function graph(){if(ac)return;const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;ac=new AC();analyser=ac.createAnalyser();analyser.fftSize=2048;analyser.smoothingTimeConstant=.55;ac.createMediaElementSource(audio).connect(analyser);analyser.connect(ac.destination);data=new Float32Array(analyser.fftSize);bins=new Uint8Array(analyser.frequencyBinCount);}
 function getMarks(){return item?.marks||[];}
@@ -177,15 +179,21 @@ function button(label,fn){const b=document.createElement('button');b.textContent
 function actions(title){$('action-title').textContent=title;$('action-body').replaceChildren();if(!$('actions').open)$('actions').showModal();return $('action-body');}
 function uniqueName(name,parent,except){if(items.some(x=>x.parent===parent&&x.name===name&&x.id!==except))throw Error('同じ名前の項目があります。');return name;}
 function rename(x){const body=actions(x?'名前を変更':'新しいフォルダ'),input=document.createElement('input');input.value=x?.name||'';input.maxLength=240;input.setAttribute('aria-label','名前');body.append(input);body.append(button('保存',async()=>{const parent=x?x.parent:page,name=uniqueName(validName(input.value),parent,x?.id);const latest=x?(await db.all()).find(y=>y.id===x.id):null;if(x&&!latest)throw Error('項目が見つかりません。');await db.put(latest?{...latest,name}:{id:crypto.randomUUID(),name,parent,root:items.find(y=>y.id===page).root,type:'folder',created:Date.now()});$('actions').close();await refresh();}));input.focus();}
-function menu(x){if(busy||ROOTS.includes(x.id))return;const body=actions(x.name);body.append(button('名前を変更',()=>rename(x)),button('別のフォルダへ移動',()=>move(x)));if(x.type!=='folder'&&!x.pending)body.append(button('字幕を設定',()=>subtitleMenu(x)));if(x.type!=='folder'&&!x.pending)body.append(button('ファイルに書き出す',()=>{const a=document.createElement('a');a.href=localMediaURL(x,true);a.download=x.name;document.body.append(a);a.click();a.remove();}));const del=button('削除',async()=>{const ids=descendants(items,x.id);if(!confirm('「'+x.name+'」'+(ids.size>1?'と中の'+(ids.size-1)+'項目':'')+'を削除しますか？'))return;await markQueue;await db.remove([...ids]);$('actions').close();await refresh();});del.className='danger';body.append(del);}
+function menu(x){if(busy||ROOTS.includes(x.id))return;const body=actions(x.name);body.append(button('名前を変更',()=>rename(x)),button('別のフォルダへ移動',()=>move(x)));if(x.type!=='folder'&&!x.pending){body.append(button('サムネイルを変更',()=>{thumbnailTarget=x.id;$('thumbnail-file').value='';$('thumbnail-file').click();}));if(x.type==='video')body.append(button('動画からサムネイルを作り直す',()=>regenerateThumb(x)));body.append(button('字幕を設定',()=>subtitleMenu(x)));}if(x.type!=='folder'&&!x.pending)body.append(button('ファイルに書き出す',()=>{const a=document.createElement('a');a.href=localMediaURL(x,true);a.download=x.name;document.body.append(a);a.click();a.remove();}));const del=button('削除',async()=>{const ids=descendants(items,x.id);if(!confirm('「'+x.name+'」'+(ids.size>1?'と中の'+(ids.size-1)+'項目':'')+'を削除しますか？'))return;await markQueue;await db.remove([...ids]);$('actions').close();await refresh();});del.className='danger';body.append(del);}
 function move(x){let target=x.root;const excluded=descendants(items,x.id);function show(){const body=actions('移動先を選択'),p=document.createElement('p');p.textContent=ancestors(items,target).map(y=>y.name).join(' / ');body.append(p);const parent=items.find(y=>y.id===target)?.parent;if(parent)body.append(button('‹ 上のフォルダ',()=>{target=parent;show();}));for(const f of items.filter(y=>y.type==='folder'&&y.parent===target&&!excluded.has(y.id)))body.append(button('📁 '+f.name,()=>{target=f.id;show();}));const save=button('このフォルダへ移動',async()=>{if(!canMove(items,x,target))throw Error('この場所には移動できません。');uniqueName(x.name,target,x.id);const latest=(await db.all()).find(y=>y.id===x.id);if(!latest)throw Error('項目が見つかりません。');await db.put({...latest,parent:target});$('actions').close();await refresh();});save.disabled=!canMove(items,x,target);body.append(save);}show();}
-async function importFiles(list){
- if(busy||!list.length)return;const parent=page;busy=true;importController=new AbortController();render();$('import-status').hidden=false;$('import-cancel').hidden=false;$('import-cancel').textContent='取り込みを中止';let success=0;const failures=[];
- try{for(let i=0;i<list.length;i++){
-  if(importController.signal.aborted)break;const file=list[i];const started=performance.now();let done=0,phase='read';
-  const display=()=>{$('import-status').textContent=`${i+1}/${list.length} ${file.name} — `+importProgress(done,file.size,(performance.now()-started)/1000,phase);};
-  display();const ticker=setInterval(display,1000);
-  try{
+let retryFiles=[],retryParent='home';
+async function importFiles(selection,parent=page){
+ const list=Array.from(selection);if(busy||!list.length)return;
+ busy=true;importController=new AbortController();retryParent=parent;retryFiles=[];render();
+ $('import-status').hidden=false;$('import-cancel').hidden=false;$('import-retry').hidden=true;$('import-cancel').textContent='取り込みを中止';
+ $('import-results').replaceChildren();let success=0;
+ const rows=list.map(file=>{const row=document.createElement('li');row.textContent=file.name+' — 待機中';$('import-results').append(row);return row;});
+ try{
+  await runImportBatch(list,{signal:importController.signal,process:async(file,i)=>{
+   const started=performance.now();let done=0,phase='read';
+   const display=()=>{$('import-status').textContent=`${i+1}/${list.length}（保存済み ${success}件） ${file.name} — `+importProgress(done,file.size,(performance.now()-started)/1000,phase);};
+   rows[i].textContent=file.name+' — 保存中';display();const ticker=setInterval(display,1000);
+   try{
    const ext=file.name.split('.').pop().toLowerCase();if(!['mp4','mp3'].includes(ext))throw Error('MP4・MP3のみ対応しています。');if(!file.size)throw Error('空のファイルです。');
    const type=ext==='mp4'?'video':'audio',destination=parent==='home'?type:parent;
    if(parent!=='home'&&items.find(x=>x.id===parent)?.root!==type)throw Error('対応する「ビデオ」または「音声」のフォルダに追加してください。');
@@ -194,21 +202,25 @@ async function importFiles(list){
    // Large files are saved first; thumbnail probing must not delay import.
    const entry={id:crypto.randomUUID(),name,parent:destination,root:type,type,size:file.size,mime:type==='video'?'video/mp4':'audio/mpeg',created:Date.now()};
    const saved=await db.add(entry,file,(bytes)=>{done=bytes;phase='write';display();},{signal:importController.signal,onRead:()=>{phase='read';display();}});
-   items.push(saved);success++;
-   if(file.size<=64*1024*1024&&!importController.signal.aborted){phase='thumbnail';display();try{const meta=await metadata(file,type);const latest=(await db.all()).find(x=>x.id===saved.id);if(latest)await db.put({...latest,...meta});}catch{}}
-  }catch(e){failures.push(file.name+': '+formatImportError(e));if(e?.name==='AbortError'||importController.signal.aborted)break;}
-  finally{clearInterval(ticker);}
- }}finally{
-  const cancelled=importController?.signal.aborted;busy=false;importController=null;$('import-cancel').hidden=true;
-  $('import-status').textContent=`${success}件を保存しました。`+(cancelled?'取り込みを中止しました。':'')+(failures.length?' 保存できなかったファイル: '+failures.join(' / '):'');
-  try{await refresh();}catch(e){$('import-status').textContent+=' 一覧の更新に失敗: '+formatImportError(e);}
+   items.push(saved);if(type==='video')thumbQueue.add(saved.id);return saved;
+
+   }finally{clearInterval(ticker);}
+  },onResult:r=>{
+   if(r.status==='saved'){success++;rows[r.index].textContent=r.file.name+' — 保存済み';}
+   else{retryFiles.push(r.file);rows[r.index].textContent=r.file.name+' — '+(r.status==='cancelled'?'中止・未保存':formatImportError(r.error));}
+  }});
+ }catch(e){error(e);}finally{
+  busy=false;importController=null;$('import-cancel').hidden=true;$('import-retry').hidden=!retryFiles.length;
+  $('import-status').textContent=`${list.length}件中 ${success}件を保存しました。`+(retryFiles.length?`${retryFiles.length}件は未保存です。下の一覧を確認してください。`:'');
+  try{await refresh();scheduleThumbs();}catch(e){error(e);}
  }
 }
 async function info(){try{const u=await navigator.storage?.estimate?.(),protectedStorage=await navigator.storage?.persisted?.();$('storage-info').textContent=(u?size(u.usage)+' 使用 / 容量の目安 '+size(u.quota):'容量情報なし')+'。保存保護: '+(protectedStorage?'許可済み':'未許可');}catch{$('storage-info').textContent='容量情報を取得できません。';}$('offline-info').textContent=offlineReady?'オフライン用画面を準備済み':'オフラインの準備中、または未完了';$('about').showModal();}
 $('back').onclick=back;$('info').onclick=info;$('close').onclick=()=>$('about').close();$('action-close').onclick=()=>$('actions').close();$('new-folder').onclick=()=>rename();
-$('add').onclick=()=>{const root=items.find(x=>x.id===page)?.root;$('file').accept=root==='video'?'.mp4,video/mp4':root==='audio'?'.mp3,audio/mpeg':'.mp4,.mp3,video/mp4,audio/mpeg';$('file').click();};
+$('add').onclick=()=>{$('file').value='';const root=items.find(x=>x.id===page)?.root;$('file').accept=root==='video'?'.mp4,video/mp4':root==='audio'?'.mp3,audio/mpeg':'.mp4,.mp3,video/mp4,audio/mpeg';$('file').click();};
 $('import-cancel').onclick=()=>{importController?.abort();$('import-cancel').textContent='中止処理中…';};
-$('file').onchange=e=>{const list=Array.from(e.target.files);e.target.value='';importFiles(list).catch(error);};
+$('file').onchange=e=>{const list=Array.from(e.target.files);importFiles(list).catch(error);};
+$('import-retry').onclick=()=>importFiles(retryFiles,retryParent).catch(error);
 $('protect').onclick=async()=>{try{const granted=await navigator.storage?.persist?.();$('storage-info').textContent=granted?'保存保護が許可されました。Webサイトデータの手動削除は防げません。':'この環境では保存保護が許可されませんでした。元ファイルは別にも保管してください。';}catch(e){error(e);}};
 window.addEventListener('beforeunload',e=>{if(busy){e.preventDefault();e.returnValue='';}});
 let subtitleTarget=null;
@@ -227,6 +239,23 @@ function editSubtitle(x){
  body.append(button('保存',async()=>{const start=Number(inputs[0].value),end=Number(inputs[1].value),text=inputs[2].value.trim();if(!Number.isFinite(start)||!Number.isFinite(end)||start<0||end<=start||!text)throw Error('開始・終了時刻と字幕の文章を確認してください。');await saveSubtitles(x,[...(x.subtitles||[]),{start,end,text}].sort((a,b)=>a.start-b.start));$('actions').close();}));
 }
 $('subtitle-file').onchange=async e=>{const file=e.target.files[0],target=subtitleTarget;e.target.value='';if(!file||!target)return;try{if(file.size>5*1024*1024)throw Error('字幕ファイルは5MB以下で指定してください。');const cues=parseSubtitles(await file.text());await saveSubtitles(target,cues);$('actions').close();notice(cues.length+'件の字幕を保存しました。');}catch(e){error(e);}};
+let thumbnailTarget=null,thumbWorker=false;
+const thumbQueue=new Set(),attemptedThumbs=new Set();
+function updateThumbTiles(){for(const card of document.querySelectorAll('[data-item-id]')){const entry=items.find(x=>x.id===card.dataset.itemId),art=card.querySelector('.thumb');if(!entry?.thumb||!art)continue;let img=art.querySelector('img');if(!img){img=document.createElement('img');img.alt='';art.replaceChildren(img);}if(img.getAttribute('src')!==entry.thumb)img.src=entry.thumb;}}
+async function reloadThumbMetadata(){items=await db.all();if(item){const x=items.find(x=>x.id===item.id);if(x){item.thumb=x.thumb;item.thumbSource=x.thumbSource;}}updateThumbTiles();}
+function scheduleThumbs(){for(const x of items)if(x.type==='video'&&!x.pending&&!x.thumb&&!attemptedThumbs.has(x.id))thumbQueue.add(x.id);runThumbQueue();}
+async function runThumbQueue(){
+ if(thumbWorker||!thumbQueue.size||!navigator.serviceWorker?.controller)return;thumbWorker=true;
+ try{while(thumbQueue.size){
+  if(busy||item||libraryDrag?.active()){setTimeout(runThumbQueue,1500);break;}
+  const id=thumbQueue.values().next().value;thumbQueue.delete(id);attemptedThumbs.add(id);
+  const x=(await db.all()).find(x=>x.id===id);if(!x||x.thumb||x.pending)continue;
+  const image=await videoThumbnail(localMediaURL(x));if(image){await db.setThumbnail(id,image,'auto');await reloadThumbMetadata();}
+ }}catch(e){console.warn('Thumbnail preparation failed',e);}finally{thumbWorker=false;}
+}
+async function regenerateThumb(x){const body=actions('サムネイルを作成中…');body.textContent='動画から画像を取得しています。';const image=await videoThumbnail(localMediaURL(x));if(!image)throw Error('動画から画像を取得できませんでした。「サムネイルを変更」から画像を選べます。');await db.setThumbnail(x.id,image,'auto',true);await reloadThumbMetadata();$('actions').close();}
+$('thumbnail-file').onchange=async e=>{const file=e.target.files[0],id=thumbnailTarget;if(!file||!id)return;try{const image=await imageThumbnail(file);await db.setThumbnail(id,image,'custom');await reloadThumbMetadata();$('actions').close();}catch(e){error(e);}};
+video.addEventListener('loadeddata',()=>{if(!item||item.type!=='video'||item.thumb)return;const id=item.id;try{const c=document.createElement('canvas');c.width=480;c.height=Math.max(1,Math.round(480*video.videoHeight/video.videoWidth));c.getContext('2d').drawImage(video,0,0,c.width,c.height);db.setThumbnail(id,c.toDataURL('image/jpeg',.8),'auto').then(reloadThumbMetadata).catch(()=>{});}catch{}});
 libraryDrag=enableLibraryDrag({
  items:()=>items,page:()=>typeof page==='string'?page:page.parent,
  blocked:()=>busy||navigating||typeof page!=='string'||$('actions').open||$('about').open,
@@ -246,5 +275,5 @@ libraryDrag=enableLibraryDrag({
 });
 try{
  await db.openDB();items=await db.all();render();
- if('serviceWorker' in navigator){navigator.serviceWorker.addEventListener('controllerchange',()=>{if(item&&media.error){media.load();notice('再生の準備ができました。再生ボタンを押してください。');}});navigator.serviceWorker.register('./sw.js').then(()=>navigator.serviceWorker.ready).then(()=>{offlineReady=true;}).catch(()=>{$('import-status').hidden=false;$('import-status').textContent='オフラインの準備に失敗しました。オンラインで再読み込みしてください。';});}
+ if('serviceWorker' in navigator){navigator.serviceWorker.addEventListener('controllerchange',()=>{scheduleThumbs();if(item&&media.error){media.load();notice('再生の準備ができました。再生ボタンを押してください。');}});navigator.serviceWorker.register('./sw.js').then(()=>navigator.serviceWorker.ready).then(()=>{offlineReady=true;scheduleThumbs();}).catch(()=>{$('import-status').hidden=false;$('import-status').textContent='オフラインの準備に失敗しました。オンラインで再読み込みしてください。';});}
 }catch(e){$('add').disabled=true;$('new-folder').disabled=true;$('library').textContent='保存データを開けませんでした。Safariの通常モードで開いてください。'+e.message;}
