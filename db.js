@@ -4,14 +4,39 @@ export function storageError(value,fallback='保存処理に失敗しました�
  const e=new Error(typeof value==='string'?value:value?.message||fallback);e.name=value?.name||'StorageError';return e;
 }
 function abortError(){return new DOMException('取り込みを中止しました。','AbortError');}
-function readPart(part,signal){
+export async function retryStorage(operation,{signal,stage='保存',onRetry=()=>{},delay=250}={}){
+ for(let attempt=0;;attempt++){
+  if(signal?.aborted)throw abortError();
+  try{return await operation();}catch(value){
+   if(signal?.aborted)throw abortError();
+   const e=storageError(value);
+   if(attempt>=2||!['AbortError','UnknownError','NotReadableError'].includes(e.name)){
+    const wrapped=new Error(stage+'中に失敗しました。'+e.message);wrapped.name=e.name;wrapped.stage=stage;throw wrapped;
+   }
+   onRetry(attempt+1,stage);
+   await new Promise(resolve=>setTimeout(resolve,delay*(attempt+1)));
+  }
+ }
+}
+export function readPart(part,signal,timeoutMs=45000){
  return new Promise((resolve,reject)=>{
   if(signal?.aborted){reject(abortError());return;}
+  let settled=false,reader;
   const stop=()=>finish(reject,abortError());
-  const timer=setTimeout(()=>finish(reject,new DOMException('元ファイルの読み込みが45秒以上進んでいません。「ファイル」アプリで端末へのダウンロード完了を確認してから再試行してください。','NotReadableError')),45000);
-  function finish(fn,value){clearTimeout(timer);signal?.removeEventListener('abort',stop);fn(value);}
+  const timer=setTimeout(()=>finish(reject,new DOMException('元ファイルの読み込みが進みません。「ファイル」アプリで端末へのダウンロード完了を確認してください。','NotReadableError')),timeoutMs);
+  function finish(fn,value){
+   if(settled)return;settled=true;clearTimeout(timer);signal?.removeEventListener('abort',stop);
+   if(reader){reader.onload=reader.onerror=reader.onabort=null;if(reader.readyState===1)reader.abort();}
+   fn(value);
+  }
   signal?.addEventListener('abort',stop,{once:true});
-  Promise.resolve().then(()=>part.arrayBuffer()).then(b=>finish(resolve,b),e=>finish(reject,storageError(e,'元ファイルを読み込めませんでした。')));
+  // FileReader can actually cancel a pending Safari read before retrying it.
+  // Blob.arrayBuffer() cannot be cancelled and could leave overlapping reads.
+  if(typeof FileReader!=='undefined'){
+   reader=new FileReader();reader.onload=()=>finish(resolve,reader.result);
+   reader.onerror=()=>finish(reject,storageError(reader.error));reader.onabort=()=>finish(reject,abortError());
+   try{reader.readAsArrayBuffer(part);}catch(e){finish(reject,storageError(e));}
+  }else{Promise.resolve().then(()=>part.arrayBuffer()).then(b=>finish(resolve,b),e=>finish(reject,storageError(e)));}
  });
 }
 
@@ -38,28 +63,28 @@ export const all=()=>read('items',null,true);
 export async function blob(id){const item=await read('items',id);if(!item||item.pending)return undefined;if(item.storage!=='chunks')return read('media',id);const parts=[];for(let i=0;i<Math.ceil(item.size/item.chunkSize);i++){const row=await read('chunks',[id,i]);if(!row)throw new Error('保存データの一部がありません');parts.push(row.data);}return new Blob(parts,{type:item.mime});}
 export const put=item=>mutate(['items'],tx=>tx.objectStore('items').put(item));
 export async function add(item,file,onProgress=()=>{},options={}){
- const saved={...item,size:file.size,mime:item.mime||file.type,storage:'chunks',chunkSize:CHUNK_SIZE,pending:true};
- await mutate(['items'],tx=>tx.objectStore('items').add(saved));
+ const saved={...item,size:file.size,mime:item.mime||file.type,storage:'chunks',chunkEncoding:'arraybuffer',chunkSize:CHUNK_SIZE,pending:true};
+ await retryStorage(()=>mutate(['items'],tx=>tx.objectStore('items').add(saved)),{...options,stage:'保存の準備'});
  let committed=0;
  try{
   for(let offset=0,index=0;offset<file.size;){
    const batch=[];
-   // Each batch contains at most 32 MiB; no whole-file ArrayBuffer.
-   while(batch.length<4&&offset<file.size){
+   // One 8 MiB chunk per transaction limits transient memory on iPad.
+   while(batch.length<1&&offset<file.size){
     if(options.signal?.aborted)throw abortError();
     const end=Math.min(offset+CHUNK_SIZE,file.size);
     options.onRead?.(offset,file.size,committed);
-    const buffer=await readPart(file.slice(offset,end),options.signal);
+    const buffer=await retryStorage(()=>readPart(file.slice(offset,end),options.signal),{...options,stage:"元ファイルの読み込み"});
     if(buffer.byteLength!==end-offset)throw new DOMException('元ファイルの一部を読み込めませんでした。','NotReadableError');
-    batch.push({id:item.id,index,data:new Blob([buffer],{type:saved.mime}),end});
+    batch.push({id:item.id,index,data:buffer,end});
     offset=end;index++;
    }
    if(options.signal?.aborted)throw abortError();
-   await mutate(['chunks'],tx=>{for(const {id,index,data} of batch)tx.objectStore('chunks').add({id,index,data});});
-   for(const row of batch){committed=row.end;onProgress(committed,file.size);}
+   await retryStorage(()=>mutate(['chunks'],tx=>{for(const {id,index,data} of batch)tx.objectStore('chunks').put({id,index,data});}),{...options,stage:'端末への保存'});
+   for(const row of batch){committed=row.end;onProgress(committed,file.size);}await new Promise(resolve=>setTimeout(resolve,0));
   }
   if(options.signal?.aborted)throw abortError();
-  saved.pending=false;await put(saved);return saved;
+  saved.pending=false;await retryStorage(()=>put(saved),{...options,stage:'保存の確定'});return saved;
  }catch(e){try{await remove([item.id]);}catch{}throw storageError(e);}
 }
 export const remove=ids=>mutate(['items','media','chunks'],tx=>{for(const id of ids){tx.objectStore('items').delete(id);tx.objectStore('media').delete(id);const req=tx.objectStore('chunks').index('file').openCursor(IDBKeyRange.only(id));req.onsuccess=()=>{const cursor=req.result;if(cursor){cursor.delete();cursor.continue();}};}});

@@ -1,9 +1,9 @@
 import {imageThumbnail,videoThumbnail} from './thumbnails.js';
-import {runImportBatch} from './import-batch.js';
-import {enableLibraryDrag,validateDrop} from './library-drag.js';
-import {formatImportError,importProgress} from './import-status.js';
+import {runImportBatch} from './import-batch.js?v=3.4.0';
+import {enableLibraryDrag,validateDrop} from './library-drag.js?v=3.4.0';
+import {formatImportError,importProgress} from './import-status.js?v=3.4.0';
 import {parseSubtitles} from './subtitles.js';
-import * as db from './db.js?v=3.3.0';
+import * as db from './db.js?v=3.4.0';
 import {ROOTS,ancestors,descendants,canMove,validName} from './model.js';
 const $=id=>document.getElementById(id),audio=$('audio'),video=$('video'),ctx=$('canvas').getContext('2d');
 const icons={volume:'<path d="M11 5 6 9H3v6h3l5 4Z M15 8a6 6 0 0 1 0 8M18 5a10 10 0 0 1 0 14"/>',mark:'<path d="M6 21V4m0 0c4-3 8 3 13 0v10c-5 3-9-3-13 0"/>',cc:'<rect x="2" y="5" width="20" height="14" rx="3"/><path d="M10 10a3 3 0 1 0 0 4M18 10a3 3 0 1 0 0 4"/>',play:'<path d="m8 5 11 7-11 7Z" fill="currentColor" stroke="none"/>',pause:'<path d="M8 5v14M16 5v14" stroke-width="4"/>',full:'<path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/>',exit:'<path d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/>'};
@@ -181,27 +181,44 @@ function uniqueName(name,parent,except){if(items.some(x=>x.parent===parent&&x.na
 function rename(x){const body=actions(x?'名前を変更':'新しいフォルダ'),input=document.createElement('input');input.value=x?.name||'';input.maxLength=240;input.setAttribute('aria-label','名前');body.append(input);body.append(button('保存',async()=>{const parent=x?x.parent:page,name=uniqueName(validName(input.value),parent,x?.id);const latest=x?(await db.all()).find(y=>y.id===x.id):null;if(x&&!latest)throw Error('項目が見つかりません。');await db.put(latest?{...latest,name}:{id:crypto.randomUUID(),name,parent,root:items.find(y=>y.id===page).root,type:'folder',created:Date.now()});$('actions').close();await refresh();}));input.focus();}
 function menu(x){if(busy||ROOTS.includes(x.id))return;const body=actions(x.name);body.append(button('名前を変更',()=>rename(x)),button('別のフォルダへ移動',()=>move(x)));if(x.type!=='folder'&&!x.pending){body.append(button('サムネイルを変更',()=>{thumbnailTarget=x.id;$('thumbnail-file').value='';$('thumbnail-file').click();}));if(x.type==='video')body.append(button('動画からサムネイルを作り直す',()=>regenerateThumb(x)));body.append(button('字幕を設定',()=>subtitleMenu(x)));}if(x.type!=='folder'&&!x.pending)body.append(button('ファイルに書き出す',()=>{const a=document.createElement('a');a.href=localMediaURL(x,true);a.download=x.name;document.body.append(a);a.click();a.remove();}));const del=button('削除',async()=>{const ids=descendants(items,x.id);if(!confirm('「'+x.name+'」'+(ids.size>1?'と中の'+(ids.size-1)+'項目':'')+'を削除しますか？'))return;await markQueue;await db.remove([...ids]);$('actions').close();await refresh();});del.className='danger';body.append(del);}
 function move(x){let target=x.root;const excluded=descendants(items,x.id);function show(){const body=actions('移動先を選択'),p=document.createElement('p');p.textContent=ancestors(items,target).map(y=>y.name).join(' / ');body.append(p);const parent=items.find(y=>y.id===target)?.parent;if(parent)body.append(button('‹ 上のフォルダ',()=>{target=parent;show();}));for(const f of items.filter(y=>y.type==='folder'&&y.parent===target&&!excluded.has(y.id)))body.append(button('📁 '+f.name,()=>{target=f.id;show();}));const save=button('このフォルダへ移動',async()=>{if(!canMove(items,x,target))throw Error('この場所には移動できません。');uniqueName(x.name,target,x.id);const latest=(await db.all()).find(y=>y.id===x.id);if(!latest)throw Error('項目が見つかりません。');await db.put({...latest,parent:target});$('actions').close();await refresh();});save.disabled=!canMove(items,x,target);body.append(save);}show();}
+async function ensureMediaReader(){
+ if(!navigator.serviceWorker)throw Error('保存・再生の準備ができません。Safariで開いてください。');
+ async function ready(){
+  if(!navigator.serviceWorker.controller)return false;
+  try{const response=await fetch(new URL('./__media_version__',location.href),{cache:'no-store',signal:AbortSignal.timeout(2000)});return response.headers.get('X-MyTube-Media')==='3';}catch{return false;}
+ }
+ // Existing compatible workers also allow import while offline.
+ if(await ready())return;
+ await navigator.serviceWorker.register('./sw.js');
+ const deadline=Date.now()+15000;
+ while(Date.now()<deadline){if(await ready())return;await new Promise(resolve=>setTimeout(resolve,250));}
+ throw Error('新しい保存方式を準備中です。この画面を閉じて開き直してください。保存データの削除は不要です。');
+}
 let retryFiles=[],retryParent='home';
 async function importFiles(selection,parent=page){
  const list=Array.from(selection);if(busy||!list.length)return;
  busy=true;importController=new AbortController();retryParent=parent;retryFiles=[];render();
  $('import-status').hidden=false;$('import-cancel').hidden=false;$('import-retry').hidden=true;$('import-cancel').textContent='取り込みを中止';
  $('import-results').replaceChildren();let success=0;
- const rows=list.map(file=>{const row=document.createElement('li');row.textContent=file.name+' — 待機中';$('import-results').append(row);return row;});
+ const rows=list.map(file=>{const row=document.createElement('li');row.textContent=file.name+' — 順番待ち（まだ読み込みません）';$('import-results').append(row);return row;});
  try{
-  await runImportBatch(list,{signal:importController.signal,process:async(file,i)=>{
+  $('import-status').textContent='保存・再生の準備を確認中…';
+  await ensureMediaReader();
+  // Finish any already running thumbnail read before opening the first file.
+  while(thumbWorker)await new Promise(resolve=>setTimeout(resolve,100));
+  await runImportBatch(list,{signal:importController.signal,betweenFiles:()=>new Promise(resolve=>setTimeout(resolve,300)),process:async(file,i)=>{
    const started=performance.now();let done=0,phase='read';
-   const display=()=>{$('import-status').textContent=`${i+1}/${list.length}（保存済み ${success}件） ${file.name} — `+importProgress(done,file.size,(performance.now()-started)/1000,phase);};
+   const display=()=>{$('import-status').textContent=`${i+1}/${list.length} を1件ずつ取り込み中（保存済み ${success}件） ${file.name} — `+importProgress(done,file.size,(performance.now()-started)/1000,phase);};
    rows[i].textContent=file.name+' — 保存中';display();const ticker=setInterval(display,1000);
    try{
    const ext=file.name.split('.').pop().toLowerCase();if(!['mp4','mp3'].includes(ext))throw Error('MP4・MP3のみ対応しています。');if(!file.size)throw Error('空のファイルです。');
    const type=ext==='mp4'?'video':'audio',destination=parent==='home'?type:parent;
    if(parent!=='home'&&items.find(x=>x.id===parent)?.root!==type)throw Error('対応する「ビデオ」または「音声」のフォルダに追加してください。');
-   const usage=await navigator.storage?.estimate?.();if(usage?.quota&&usage.quota-usage.usage<file.size*1.05)throw new DOMException('空き容量が足りません。','QuotaExceededError');
+   let usage;try{usage=await navigator.storage?.estimate?.();}catch{/* An unavailable estimate must not prevent saving. */}if(usage?.quota&&usage.quota-usage.usage<file.size*1.05)throw new DOMException('空き容量が足りません。','QuotaExceededError');
    let name=file.name,index=2;while(items.some(x=>x.parent===destination&&x.name===name))name=file.name.replace(/\.(mp4|mp3)$/i,` (${index++}).$1`);
    // Large files are saved first; thumbnail probing must not delay import.
    const entry={id:crypto.randomUUID(),name,parent:destination,root:type,type,size:file.size,mime:type==='video'?'video/mp4':'audio/mpeg',created:Date.now()};
-   const saved=await db.add(entry,file,(bytes)=>{done=bytes;phase='write';display();},{signal:importController.signal,onRead:()=>{phase='read';display();}});
+   const saved=await db.add(entry,file,(bytes)=>{done=bytes;phase='write';display();},{signal:importController.signal,onRetry:(attempt,stage)=>{rows[i].textContent=file.name+' — '+stage+'を再試行中（'+attempt+'/2）';},onRead:()=>{phase='read';display();}});
    items.push(saved);if(type==='video')thumbQueue.add(saved.id);return saved;
 
    }finally{clearInterval(ticker);}
@@ -209,7 +226,7 @@ async function importFiles(selection,parent=page){
    if(r.status==='saved'){success++;rows[r.index].textContent=r.file.name+' — 保存済み';}
    else{retryFiles.push(r.file);rows[r.index].textContent=r.file.name+' — '+(r.status==='cancelled'?'中止・未保存':formatImportError(r.error));}
   }});
- }catch(e){error(e);}finally{
+ }catch(e){if(!success&&!retryFiles.length){retryFiles=list;for(const row of rows)row.textContent+=' — '+formatImportError(e);}error(e);}finally{
   busy=false;importController=null;$('import-cancel').hidden=true;$('import-retry').hidden=!retryFiles.length;
   $('import-status').textContent=`${list.length}件中 ${success}件を保存しました。`+(retryFiles.length?`${retryFiles.length}件は未保存です。下の一覧を確認してください。`:'');
   try{await refresh();scheduleThumbs();}catch(e){error(e);}

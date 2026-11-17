@@ -1,6 +1,6 @@
 export function formatImportError(e){
  if(e?.name==='QuotaExceededError')return '保存容量が足りません。元ファイルは削除しないでください。';
- if(e?.name==='AbortError')return e.message||'取り込みを中止しました。';
+ if(e?.name==='AbortError')return (e.stage?e.stage+'が中断されました。':'ブラウザが処理を中断しました。')+'保存済みのファイルは残っています。未保存分を再試行してください。元ファイルがクラウド上の場合は「ファイル」アプリで端末へのダウンロード完了を確認してください。';
  if(e?.name==='NotReadableError')return e.message||'元ファイルを読み込めません。「ファイル」アプリで端末へのダウンロード完了を確認してください。';
  if(typeof e==='string'&&e)return e;
  return e?.message||'保存処理が失敗しましたが、ブラウザから原因が返されませんでした。空き容量と元ファイルの状態を確認してください。';

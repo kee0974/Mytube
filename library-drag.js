@@ -63,6 +63,8 @@ export function enableLibraryDrag(api){
   const source=api.items().find(x=>x.id===card.dataset.itemId);if(!source||ROOTS.includes(source.id)||source.pending)return;
   clearPending();const p={id:source.id,card,pointer:e.pointerId,x:e.clientX,y:e.clientY};pending=p;p.timer=setTimeout(()=>begin(p),350);
  },true);
+ // Preserve native vertical scrolling until the long hold has picked up an item.
+ document.addEventListener('touchmove',e=>{if(drag&&e.cancelable)e.preventDefault();},{capture:true,passive:false});
  document.addEventListener('pointermove',e=>{
   if(pending&&pending.pointer===e.pointerId&&Math.hypot(e.clientX-pending.x,e.clientY-pending.y)>10)clearPending();
   if(!drag||drag.pointer!==e.pointerId||drag.finishing)return;
