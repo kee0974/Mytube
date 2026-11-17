@@ -1,15 +1,16 @@
 import {imageThumbnail,videoThumbnail} from './thumbnails.js';
-import {runImportBatch} from './import-batch.js?v=3.4.0';
-import {enableLibraryDrag,validateDrop} from './library-drag.js?v=3.4.0';
-import {formatImportError,importProgress} from './import-status.js?v=3.4.0';
+import {runImportBatch} from './import-batch.js?v=3.6.0';
+import {enableLibraryDrag,validateDrop} from './library-drag.js?v=3.6.0';
+import {formatImportError,importProgress} from './import-status.js?v=3.6.0';
 import {parseSubtitles} from './subtitles.js';
-import * as db from './db.js?v=3.4.0';
-import {ROOTS,ancestors,descendants,canMove,validName} from './model.js';
+import * as db from './db.js?v=3.6.0';
+import {ROOTS,ancestors,descendants,canMove,validName,planMoves} from './model.js?v=3.6.0';
 const $=id=>document.getElementById(id),audio=$('audio'),video=$('video'),ctx=$('canvas').getContext('2d');
 const icons={volume:'<path d="M11 5 6 9H3v6h3l5 4Z M15 8a6 6 0 0 1 0 8M18 5a10 10 0 0 1 0 14"/>',mark:'<path d="M6 21V4m0 0c4-3 8 3 13 0v10c-5 3-9-3-13 0"/>',cc:'<rect x="2" y="5" width="20" height="14" rx="3"/><path d="M10 10a3 3 0 1 0 0 4M18 10a3 3 0 1 0 0 4"/>',play:'<path d="m8 5 11 7-11 7Z" fill="currentColor" stroke="none"/>',pause:'<path d="M8 5v14M16 5v14" stroke-width="4"/>',full:'<path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/>',exit:'<path d="M3 8h5V3m8 0v5h5M8 21v-5H3m13 5v-5h5"/>'};
 const icon=(id,n)=>$(id).innerHTML='<svg viewBox="0 0 24 24" aria-hidden="true">'+icons[n]+'</svg>';
 icon('volbtn','volume');icon('mark','mark');icon('cc','cc');icon('play','play');icon('full','full');$('cc').classList.add('on');
 let page='home',stack=[],item=null,media=audio,ac,analyser,data,bins,raf=0,cc=true,dragging=false,gesture=null,lastTap=null,feedbackTimer;
+let selecting=false;const selectedIds=new Set();
 let items=[],busy=false,offlineReady=false,libraryDrag=null,importController=null;
 const heights=new Float32Array(9);
 const fmt=t=>{t=Math.max(0,Math.floor(t||0));return(t>=3600?Math.floor(t/3600)+':':'')+String(Math.floor(t/60)%60).padStart(t>=3600?2:1,'0')+':'+String(t%60).padStart(2,'0');};
@@ -29,34 +30,63 @@ async function animatePage(direction,change){
   }else{main.style.transform='';change();}
  }finally{main.style.transform='';navigating=false;}
 }
-function go(p){if(busy||libraryDrag?.active())return;return animatePage('forward',()=>{stack.push(page);page=p;render();});}
-async function back(){if(!stack.length||navigating||busy)return;if(document.fullscreenElement)try{await document.exitFullscreen();}catch{}$('screen').classList.remove('expanded');document.body.style.overflow='';return animatePage('back',()=>{page=stack.pop();render();});}
+function go(p){if(busy||libraryDrag?.active())return;return animatePage('forward',()=>{selecting=false;selectedIds.clear();stack.push(page);page=p;render();});}
+async function back(){if(!stack.length||navigating||busy)return;if(document.fullscreenElement)try{await document.exitFullscreen();}catch{}$('screen').classList.remove('expanded');document.body.style.overflow='';return animatePage('back',()=>{selecting=false;selectedIds.clear();page=stack.pop();render();});}
 function render(){
  clearTimeout(tapTimer);
  if(gesture){clearTimeout(gesture.timer);gesture=null;}media.pause();cancelAnimationFrame(raf);lastTap=null;$('feedback').hidden=true;
  const playing=typeof page==='object';$('player').hidden=!playing;$('library').hidden=playing;
  const folder=items.find(x=>x.id===page);if(!playing&&page!=='home'&&!folder)page='home';
  $('back').hidden=page==='home';const previous=stack.at(-1);$('back').textContent='‹ '+(items.find(x=>x.id===previous)?.name||'ブラウズ');
- $('add').hidden=playing;$('add').disabled=busy;$('new-folder').hidden=playing||page==='home';$('new-folder').disabled=busy;
+ $('select-mode').hidden=playing||page==='home';$('select-mode').disabled=busy;$('select-mode').textContent=selecting?'完了':'選択';$('selection-tools').hidden=playing||!selecting;
+ $('add').hidden=playing||selecting;$('add').disabled=busy;$('new-folder').hidden=playing||selecting||page==='home';$('new-folder').disabled=busy;
  $('crumbs').replaceChildren();const chain=ancestors(items,playing?page.parent:page==='home'?null:page);
  for(const node of [{id:'home',name:'ブラウズ'},...chain]){const b=document.createElement('button');b.textContent=node.name;b.dataset.folderId=node.id;b.disabled=busy;b.onclick=()=>go(node.id);$('crumbs').append(b);}
- if(playing){openPlayer(page);return;}item=null;$('library').replaceChildren();$('title').textContent=folder?.name||'ブラウズ';
+ if(playing){openPlayer(page);return;}item=null;for(const m of [audio,video]){if(m.getAttribute('src')){m.removeAttribute('src');m.load();}}$('library').replaceChildren();$('title').textContent=folder?.name||'ブラウズ';
  const grid=document.createElement('div');grid.className='grid';
  const list=items.filter(x=>x.parent===(page==='home'?null:page)).sort((a,b)=>(a.type==='folder'?0:1)-(b.type==='folder'?0:1)||a.name.localeCompare(b.name,'ja'));
  for(const x of list){
-  const card=document.createElement('div');card.className='file-card';card.dataset.itemId=x.id;
+  const card=document.createElement('div');card.className='file-card';card.dataset.itemId=x.id;card.classList.toggle('selected',selectedIds.has(x.id));if(selecting){const check=document.createElement('span');check.className='selection-check';check.textContent=selectedIds.has(x.id)?'✓':'';check.setAttribute('aria-hidden','true');card.append(check);}
   const b=document.createElement('button');b.className='tile';b.disabled=busy;b.setAttribute('aria-label',x.name+'を開く');
   const a=document.createElement('span');a.className=x.type==='folder'?'folder':'thumb '+(x.type==='audio'?'music':'');
   if(x.type!=='folder'){if(x.thumb){const img=document.createElement('img');img.src=x.thumb;img.alt='';a.append(img);}else a.textContent=x.type==='audio'?'♫':'▶';}
-  b.append(a);b.onclick=()=>{if(x.pending){menu(x);return;}go(x.type==='folder'?x.id:x);};
+  if(selecting){b.setAttribute('aria-pressed',String(selectedIds.has(x.id)));b.setAttribute('aria-label',x.name+'を選択');}
+  b.append(a);b.onclick=()=>{if(selecting){toggleSelection(x.id);return;}if(x.pending){menu(x);return;}go(x.type==='folder'?x.id:x);};
   const n=document.createElement('button');n.className='name';n.textContent=x.name;n.disabled=busy;n.setAttribute('aria-label',ROOTS.includes(x.id)?x.name+'を開く':x.name+'の名前を変更');
-  n.onclick=e=>{e.stopPropagation();if(ROOTS.includes(x.id))go(x.id);else rename(x);};
+  if(selecting)n.setAttribute('aria-label',x.name+'を選択');
+  n.onclick=e=>{e.stopPropagation();if(selecting){toggleSelection(x.id);return;}if(ROOTS.includes(x.id))go(x.id);else rename(x);};
   const small=document.createElement('span');small.className='muted';small.textContent=x.type==='folder'?items.filter(y=>y.parent===x.id).length+'項目':x.pending?'取り込み中断':x.duration?fmt(x.duration):size(x.size);
   card.append(b,n,small);
-  if(!ROOTS.includes(x.id)){const more=document.createElement('button');more.className='item-menu';more.textContent='⋯';more.setAttribute('aria-label',x.name+'の操作');more.onclick=e=>{e.stopPropagation();menu(x);};card.append(more);}
+  if(!selecting&&!ROOTS.includes(x.id)){const more=document.createElement('button');more.className='item-menu';more.textContent='⋯';more.setAttribute('aria-label',x.name+'の操作');more.onclick=e=>{e.stopPropagation();menu(x);};card.append(more);}
   grid.append(card);
  }
- $('library').append(grid);$('count').textContent=list.length+'項目';setTimeout(scheduleThumbs,0);
+ $('library').append(grid);updateSelection();$('count').textContent=list.length+'項目';setTimeout(scheduleThumbs,0);
+}
+function updateSelection(){
+ for(const id of selectedIds)if(!items.some(x=>x.id===id&&x.parent===page))selectedIds.delete(id);
+ $('selection-count').textContent=selectedIds.size+'件選択';
+ $('selection-move').disabled=busy||!selectedIds.size;$('selection-delete').disabled=busy||!selectedIds.size;
+ $('select-none').disabled=busy||!selectedIds.size;$('select-all').disabled=busy;
+ for(const card of document.querySelectorAll('[data-item-id]')){const on=selectedIds.has(card.dataset.itemId);card.classList.toggle('selected',on);const check=card.querySelector('.selection-check');if(check)check.textContent=on?'✓':'';if(selecting)card.querySelector('.tile')?.setAttribute('aria-pressed',String(on));}
+}
+function toggleSelection(id){if(busy||ROOTS.includes(id))return;selectedIds.has(id)?selectedIds.delete(id):selectedIds.add(id);updateSelection();}
+$('select-mode').onclick=()=>{selecting=!selecting;selectedIds.clear();render();};
+$('select-all').onclick=()=>{for(const x of items)if(x.parent===page&&!ROOTS.includes(x.id))selectedIds.add(x.id);updateSelection();};
+$('select-none').onclick=()=>{selectedIds.clear();updateSelection();};
+$('selection-delete').onclick=()=>confirmDeletion([...selectedIds],selectedIds.size+'件の選択項目');
+$('selection-move').onclick=()=>moveSelected([...selectedIds]);
+function moveSelected(ids){
+ const selection=items.filter(x=>ids.includes(x.id));if(!selection.length)return;
+ let target=selection[0].root;const excluded=new Set();for(const x of selection)for(const id of descendants(items,x.id))excluded.add(id);
+ function show(){
+  const body=actions(ids.length+'件の移動先'),path=document.createElement('p');path.textContent=ancestors(items,target).map(x=>x.name).join(' / ');body.append(path);
+  const parent=items.find(x=>x.id===target)?.parent;if(parent)body.append(button('‹ 上のフォルダ',()=>{target=parent;show();}));
+  for(const x of items.filter(x=>x.type==='folder'&&x.parent===target&&!excluded.has(x.id)))body.append(button('📁 '+x.name,()=>{target=x.id;show();}));
+  const message=document.createElement('p');body.append(message);
+  const commit=button('このフォルダへ移動',async()=>{for(const b of body.querySelectorAll('button'))b.disabled=true;busy=true;$('action-close').disabled=true;try{await markQueue;const count=await db.moveMany(ids,target);items=await db.all();selecting=false;selectedIds.clear();busy=false;render();$('actions').close();$('import-status').hidden=false;$('import-status').textContent=count+'件を移動しました。';}catch(e){message.textContent=formatImportError(e);for(const b of body.querySelectorAll('button'))b.disabled=false;}finally{busy=false;$('action-close').disabled=false;}});
+  try{commit.disabled=!planMoves(items,ids,target).length;if(commit.disabled)message.textContent='現在の保存場所です。別のフォルダを選んでください。';}catch(e){commit.disabled=true;message.textContent=e.message;}
+  body.append(commit);
+ }show();
 }
 function graph(){if(ac)return;const AC=window.AudioContext||window.webkitAudioContext;if(!AC)return;ac=new AC();analyser=ac.createAnalyser();analyser.fftSize=2048;analyser.smoothingTimeConstant=.55;ac.createMediaElementSource(audio).connect(analyser);analyser.connect(ac.destination);data=new Float32Array(analyser.fftSize);bins=new Uint8Array(analyser.frequencyBinCount);}
 function getMarks(){return item?.marks||[];}
@@ -69,7 +99,13 @@ function seek(t){if(Number.isFinite(media.duration)){media.currentTime=Math.max(
 function drawMarks(){$('marks').replaceChildren();$('ticks').replaceChildren();for(const m of [...getMarks()].sort((a,b)=>a.t-b.t)){const b=document.createElement('button');b.textContent=fmt(m.t);b.setAttribute('aria-label',fmt(m.t)+'へ移動');b.title='タップで移動・長押しで削除';let hold,held=false;const remove=()=>{held=true;if(confirm(fmt(m.t)+'のマークを削除しますか？'))save(getMarks().filter(x=>x.id!==m.id));};b.onclick=()=>{if(!held)seek(m.t);held=false;};b.onpointerdown=()=>{held=false;hold=setTimeout(remove,650);};for(const e of ['pointerup','pointerleave','pointercancel'])b.addEventListener(e,()=>clearTimeout(hold));b.oncontextmenu=e=>{e.preventDefault();clearTimeout(hold);if(!held)remove();};$('marks').append(b);if(Number.isFinite(media.duration)&&media.duration>0){const tick=document.createElement('span');tick.className='tick';tick.style.left=Math.min(100,m.t/media.duration*100)+'%';$('ticks').append(tick);}}}
 function playState(){icon('play',media.paused?'play':'pause');$('play').setAttribute('aria-label',media.paused?'再生':'一時停止');}
 function sync(){const t=media.currentTime||0,d=media.duration;if(!dragging)$('seek').value=t;$('seek').max=Number.isFinite(d)?d:60;$('elapsed').textContent=fmt(t);$('duration').textContent=Number.isFinite(d)?fmt(d):'--:--';let caption='';caption=(item?.subtitles||[]).filter(c=>t>=c.start&&t<c.end).map(c=>c.text).join('\n');$('caption').hidden=!cc||!caption||!!gesture?.active;$('caption').firstElementChild.textContent=caption;}
-function openPlayer(x){item=x;notice('');$('title').textContent=x.name;$('count').textContent=x.type==='audio'?'音声':'ビデオ';media=x.type==='video'?video:audio;video.hidden=media!==video;$('visual').hidden=media===video;$('volbox').hidden=true;$('volbtn').setAttribute('aria-expanded','false');media.src=localMediaURL(x);media.volume=Number($('volume').value);media.load();heights.fill(0);dragging=false;$('seek').value=0;drawMarks();playState();fullState();draw();}
+function syncAudioArtwork(){
+ const art=$('audio-artwork'),src=item?.type==='audio'?item.thumb:null;
+ $('artbtn').hidden=item?.type!=='audio';
+ art.hidden=!src;
+ if(src){if(art.getAttribute('src')!==src)art.src=src;}else art.removeAttribute('src');
+}
+function openPlayer(x){item=x;notice('');$('title').textContent=x.name;$('count').textContent=x.type==='audio'?'音声':'ビデオ';media=x.type==='video'?video:audio;video.hidden=media!==video;$('visual').hidden=media===video;syncAudioArtwork();$('volbox').hidden=true;$('volbtn').setAttribute('aria-expanded','false');media.src=localMediaURL(x);media.volume=Number($('volume').value);media.load();heights.fill(0);dragging=false;$('seek').value=0;drawMarks();playState();fullState();draw();}
 function draw(){if(!item)return;if(media===audio){ctx.clearRect(0,0,450,192);let rms=0;const bands=new Float32Array(9);if(analyser&&!media.paused){analyser.getFloatTimeDomainData(data);analyser.getByteFrequencyData(bins);for(const v of data)rms+=v*v;rms=Math.min(1,Math.sqrt(rms/data.length)*12);const step=ac.sampleRate/analyser.fftSize;for(let i=0;i<9;i++){const low=Math.max(1,Math.floor(100*Math.pow(1.55,i)/step)),high=Math.min(bins.length-1,Math.ceil(100*Math.pow(1.55,i+1)/step));for(let j=low;j<=high;j++)bands[i]=Math.max(bands[i],bins[j]/255);}}ctx.fillStyle='#fff';for(let i=0;i<9;i++){const target=rms*(.2+.8*bands[i]);heights[i]+=(target-heights[i])*.3;const h=24+heights[i]*145;ctx.beginPath();ctx.roundRect(22+i*47,(192-h)/2,30,h,15);ctx.fill();}}sync();raf=requestAnimationFrame(draw);}
 for(const m of [audio,video]){m.addEventListener('loadedmetadata',()=>{if(m===media){drawMarks();sync();}});for(const e of ['play','pause','ended'])m.addEventListener(e,()=>{if(m===media)playState();});m.addEventListener('error',()=>{if(m===media)notice(navigator.serviceWorker?.controller?'保存データを再生できませんでした。対応形式・保存内容を確認してください。元ファイルは削除しないでください。':'再生の準備中です。オンラインで一度再読み込みしてください。');});}
 async function togglePlayback(){if(!media.paused){media.pause();return;}try{if(media===audio){graph();if(ac)await ac.resume();}await media.play();}catch{notice('再生を開始できませんでした。もう一度押してください。');}}
@@ -164,7 +200,7 @@ main.addEventListener('lostpointercapture',e=>{
  // Only a loss belonging to main itself can cancel the page gesture.
  if(e.target===main&&swipe?.id===e.pointerId)resetSwipe();
 });
-document.addEventListener('click',e=>{if(navigating||Date.now()<suppressClickUntil){e.preventDefault();e.stopImmediatePropagation();}},true);
+document.addEventListener('click',e=>{if(e.target.closest('dialog'))return;if(navigating||Date.now()<suppressClickUntil){e.preventDefault();e.stopImmediatePropagation();}},true);
 
 function metadata(file,type){return new Promise(resolve=>{const media=document.createElement(type==='video'?'video':'audio'),url=URL.createObjectURL(file);let finished=false,seconds;media.preload='metadata';media.muted=true;media.playsInline=true;
  const finish=(thumb)=>{if(finished)return;finished=true;clearTimeout(timeout);media.removeAttribute('src');media.load();URL.revokeObjectURL(url);resolve({duration:seconds,thumb});};
@@ -179,7 +215,27 @@ function button(label,fn){const b=document.createElement('button');b.textContent
 function actions(title){$('action-title').textContent=title;$('action-body').replaceChildren();if(!$('actions').open)$('actions').showModal();return $('action-body');}
 function uniqueName(name,parent,except){if(items.some(x=>x.parent===parent&&x.name===name&&x.id!==except))throw Error('同じ名前の項目があります。');return name;}
 function rename(x){const body=actions(x?'名前を変更':'新しいフォルダ'),input=document.createElement('input');input.value=x?.name||'';input.maxLength=240;input.setAttribute('aria-label','名前');body.append(input);body.append(button('保存',async()=>{const parent=x?x.parent:page,name=uniqueName(validName(input.value),parent,x?.id);const latest=x?(await db.all()).find(y=>y.id===x.id):null;if(x&&!latest)throw Error('項目が見つかりません。');await db.put(latest?{...latest,name}:{id:crypto.randomUUID(),name,parent,root:items.find(y=>y.id===page).root,type:'folder',created:Date.now()});$('actions').close();await refresh();}));input.focus();}
-function menu(x){if(busy||ROOTS.includes(x.id))return;const body=actions(x.name);body.append(button('名前を変更',()=>rename(x)),button('別のフォルダへ移動',()=>move(x)));if(x.type!=='folder'&&!x.pending){body.append(button('サムネイルを変更',()=>{thumbnailTarget=x.id;$('thumbnail-file').value='';$('thumbnail-file').click();}));if(x.type==='video')body.append(button('動画からサムネイルを作り直す',()=>regenerateThumb(x)));body.append(button('字幕を設定',()=>subtitleMenu(x)));}if(x.type!=='folder'&&!x.pending)body.append(button('ファイルに書き出す',()=>{const a=document.createElement('a');a.href=localMediaURL(x,true);a.download=x.name;document.body.append(a);a.click();a.remove();}));const del=button('削除',async()=>{const ids=descendants(items,x.id);if(!confirm('「'+x.name+'」'+(ids.size>1?'と中の'+(ids.size-1)+'項目':'')+'を削除しますか？'))return;await markQueue;await db.remove([...ids]);$('actions').close();await refresh();});del.className='danger';body.append(del);}
+function menu(x){if(busy||ROOTS.includes(x.id))return;const body=actions(x.name);body.append(button('名前を変更',()=>rename(x)),button('別のフォルダへ移動',()=>move(x)));if(x.type!=='folder'&&!x.pending){body.append(button('サムネイルを変更',()=>{thumbnailTarget=x.id;$('thumbnail-file').value='';$('thumbnail-file').click();}));if(x.type==='video')body.append(button('動画からサムネイルを作り直す',()=>regenerateThumb(x)));body.append(button('字幕を設定',()=>subtitleMenu(x)));}if(x.type!=='folder'&&!x.pending)body.append(button('ファイルに書き出す',()=>{const a=document.createElement('a');a.href=localMediaURL(x,true);a.download=x.name;document.body.append(a);a.click();a.remove();}));const del=button('削除',()=>confirmDeletion([x.id],x.name));del.className='danger';body.append(del);}
+function confirmDeletion(roots,label){
+ const chosen=new Set();for(const id of roots)for(const child of descendants(items,id))if(!ROOTS.includes(child))chosen.add(child);
+ const selected=items.filter(x=>chosen.has(x.id)),bytes=selected.reduce((n,x)=>n+(x.size||0),0);
+ const body=actions('削除の確認'),p=document.createElement('p');
+ p.textContent='「'+label+'」を削除します。対象 '+selected.length+'項目 / ファイル容量 '+size(bytes)+'。このアプリ内のデータは元に戻せません。元の「ファイル」アプリのデータは削除しません。';body.append(p);
+ const commit=button('削除する',async()=>{
+  commit.disabled=true;cancel.disabled=true;$('action-close').disabled=true;busy=true;commit.textContent='保存データを削除中…';
+  try{
+   await markQueue;
+   for(const m of [audio,video]){m.pause();m.removeAttribute('src');m.load();}
+   await db.remove([...chosen]);
+   if(await db.remainingRecords([...chosen]))throw Error('保存データが残っています。もう一度削除してください。');
+   for(const id of chosen){thumbQueue.delete(id);attemptedThumbs.delete(id);}
+   items=await db.all();if(typeof page==='object'&&chosen.has(page.id))page=page.parent;
+   busy=false;selecting=false;selectedIds.clear();render();const result=actions('削除完了');const message=document.createElement('p');
+   message.textContent=selected.length+'項目（ファイル容量 '+size(bytes)+'）を削除しました。動画・音声の保存データ本体も残っていないことを確認しました。Safari全体の容量表示や実際の空き容量への反映は、ここでは確認できません。';result.append(message);
+  }catch(e){p.textContent=formatImportError(e);commit.disabled=false;cancel.disabled=false;commit.textContent='もう一度削除する';}
+  finally{busy=false;$('action-close').disabled=false;}
+ });commit.className='danger';const cancel=button('キャンセル',()=>$('actions').close());body.append(commit,cancel);
+}
 function move(x){let target=x.root;const excluded=descendants(items,x.id);function show(){const body=actions('移動先を選択'),p=document.createElement('p');p.textContent=ancestors(items,target).map(y=>y.name).join(' / ');body.append(p);const parent=items.find(y=>y.id===target)?.parent;if(parent)body.append(button('‹ 上のフォルダ',()=>{target=parent;show();}));for(const f of items.filter(y=>y.type==='folder'&&y.parent===target&&!excluded.has(y.id)))body.append(button('📁 '+f.name,()=>{target=f.id;show();}));const save=button('このフォルダへ移動',async()=>{if(!canMove(items,x,target))throw Error('この場所には移動できません。');uniqueName(x.name,target,x.id);const latest=(await db.all()).find(y=>y.id===x.id);if(!latest)throw Error('項目が見つかりません。');await db.put({...latest,parent:target});$('actions').close();await refresh();});save.disabled=!canMove(items,x,target);body.append(save);}show();}
 async function ensureMediaReader(){
  if(!navigator.serviceWorker)throw Error('保存・再生の準備ができません。Safariで開いてください。');
@@ -232,7 +288,8 @@ async function importFiles(selection,parent=page){
   try{await refresh();scheduleThumbs();}catch(e){error(e);}
  }
 }
-async function info(){try{const u=await navigator.storage?.estimate?.(),protectedStorage=await navigator.storage?.persisted?.();$('storage-info').textContent=(u?size(u.usage)+' 使用 / 容量の目安 '+size(u.quota):'容量情報なし')+'。保存保護: '+(protectedStorage?'許可済み':'未許可');}catch{$('storage-info').textContent='容量情報を取得できません。';}$('offline-info').textContent=offlineReady?'オフライン用画面を準備済み':'オフラインの準備中、または未完了';$('about').showModal();}
+async function info(){items=await db.all();const videos=items.filter(x=>x.type==='video'),audios=items.filter(x=>x.type==='audio');$('library-storage').textContent='このMyTube内：動画 '+videos.length+'件 / '+size(videos.reduce((n,x)=>n+(x.size||0),0))+'、音声 '+audios.length+'件 / '+size(audios.reduce((n,x)=>n+(x.size||0),0));$('delete-videos').disabled=busy||!videos.length;try{const u=await navigator.storage?.estimate?.(),protectedStorage=await navigator.storage?.persisted?.();$('storage-info').textContent=(u?size(u.usage)+' 使用 / 容量の目安 '+size(u.quota):'容量情報なし')+'。保存保護: '+(protectedStorage?'許可済み':'未許可');}catch{$('storage-info').textContent='容量情報を取得できません。';}$('offline-info').textContent=offlineReady?'オフライン用画面を準備済み':'オフラインの準備中、または未完了';$('about').showModal();}
+$('delete-videos').onclick=()=>{$('about').close();confirmDeletion(items.filter(x=>x.type==='video').map(x=>x.id),'このMyTube内の動画すべて（音声は残します）');};
 $('back').onclick=back;$('info').onclick=info;$('close').onclick=()=>$('about').close();$('action-close').onclick=()=>$('actions').close();$('new-folder').onclick=()=>rename();
 $('add').onclick=()=>{$('file').value='';const root=items.find(x=>x.id===page)?.root;$('file').accept=root==='video'?'.mp4,video/mp4':root==='audio'?'.mp3,audio/mpeg':'.mp4,.mp3,video/mp4,audio/mpeg';$('file').click();};
 $('import-cancel').onclick=()=>{importController?.abort();$('import-cancel').textContent='中止処理中…';};
@@ -257,9 +314,10 @@ function editSubtitle(x){
 }
 $('subtitle-file').onchange=async e=>{const file=e.target.files[0],target=subtitleTarget;e.target.value='';if(!file||!target)return;try{if(file.size>5*1024*1024)throw Error('字幕ファイルは5MB以下で指定してください。');const cues=parseSubtitles(await file.text());await saveSubtitles(target,cues);$('actions').close();notice(cues.length+'件の字幕を保存しました。');}catch(e){error(e);}};
 let thumbnailTarget=null,thumbWorker=false;
+$('artbtn').onclick=()=>{if(item?.type!=='audio')return;thumbnailTarget=item.id;$('thumbnail-file').value='';$('thumbnail-file').click();};
 const thumbQueue=new Set(),attemptedThumbs=new Set();
 function updateThumbTiles(){for(const card of document.querySelectorAll('[data-item-id]')){const entry=items.find(x=>x.id===card.dataset.itemId),art=card.querySelector('.thumb');if(!entry?.thumb||!art)continue;let img=art.querySelector('img');if(!img){img=document.createElement('img');img.alt='';art.replaceChildren(img);}if(img.getAttribute('src')!==entry.thumb)img.src=entry.thumb;}}
-async function reloadThumbMetadata(){items=await db.all();if(item){const x=items.find(x=>x.id===item.id);if(x){item.thumb=x.thumb;item.thumbSource=x.thumbSource;}}updateThumbTiles();}
+async function reloadThumbMetadata(){items=await db.all();if(item){const x=items.find(x=>x.id===item.id);if(x){item.thumb=x.thumb;item.thumbSource=x.thumbSource;}}syncAudioArtwork();updateThumbTiles();}
 function scheduleThumbs(){for(const x of items)if(x.type==='video'&&!x.pending&&!x.thumb&&!attemptedThumbs.has(x.id))thumbQueue.add(x.id);runThumbQueue();}
 async function runThumbQueue(){
  if(thumbWorker||!thumbQueue.size||!navigator.serviceWorker?.controller)return;thumbWorker=true;
@@ -275,7 +333,7 @@ $('thumbnail-file').onchange=async e=>{const file=e.target.files[0],id=thumbnail
 video.addEventListener('loadeddata',()=>{if(!item||item.type!=='video'||item.thumb)return;const id=item.id;try{const c=document.createElement('canvas');c.width=480;c.height=Math.max(1,Math.round(480*video.videoHeight/video.videoWidth));c.getContext('2d').drawImage(video,0,0,c.width,c.height);db.setThumbnail(id,c.toDataURL('image/jpeg',.8),'auto').then(reloadThumbMetadata).catch(()=>{});}catch{}});
 libraryDrag=enableLibraryDrag({
  items:()=>items,page:()=>typeof page==='string'?page:page.parent,
- blocked:()=>busy||navigating||typeof page!=='string'||$('actions').open||$('about').open,
+ blocked:()=>selecting||busy||navigating||typeof page!=='string'||$('actions').open||$('about').open,
  prepare:()=>{resetSwipe();clearTimeout(tapTimer);},
  suppress:()=>{suppressClickUntil=Date.now()+650;},
  navigate:async(target,backward)=>{

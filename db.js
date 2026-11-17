@@ -1,3 +1,4 @@
+import {planMoves} from './model.js?v=3.6.0';
 let db;
 export function storageError(value,fallback='保存処理に失敗しました。空き容量と元ファイルの状態を確認してください。'){
  if(value instanceof Error)return value;
@@ -89,3 +90,14 @@ export async function add(item,file,onProgress=()=>{},options={}){
 }
 export const remove=ids=>mutate(['items','media','chunks'],tx=>{for(const id of ids){tx.objectStore('items').delete(id);tx.objectStore('media').delete(id);const req=tx.objectStore('chunks').index('file').openCursor(IDBKeyRange.only(id));req.onsuccess=()=>{const cursor=req.result;if(cursor){cursor.delete();cursor.continue();}};}});
 export function setThumbnail(id,thumb,source='auto',replace=false){return mutate(['items'],tx=>{const store=tx.objectStore('items'),r=store.get(id);r.onsuccess=()=>{const entry=r.result;if(!entry||(source==='auto'&&entry.thumbSource==='custom'&&!replace))return;store.put({...entry,thumb,thumbSource:source});};});}
+
+export function remainingRecords(ids){return new Promise((resolve,reject)=>{
+ const tx=db.transaction(['items','media','chunks']);let count=0;
+ tx.oncomplete=()=>resolve(count);tx.onabort=()=>reject(storageError(tx.error));
+ for(const id of ids){for(const name of ['items','media']){const r=tx.objectStore(name).count(IDBKeyRange.only(id));r.onsuccess=()=>{count+=r.result;};}const r=tx.objectStore('chunks').index('file').count(IDBKeyRange.only(id));r.onsuccess=()=>{count+=r.result;};}
+});}
+
+export async function moveMany(ids,target){let validationError,changed=0;
+ try{await mutate(['items'],tx=>{const store=tx.objectStore('items'),r=store.getAll();r.onsuccess=()=>{try{const moves=planMoves(r.result,ids,target);changed=moves.length;for(const entry of moves)store.put(entry);}catch(e){validationError=e;tx.abort();}};});}catch(e){throw validationError||e;}
+ return changed;
+}
